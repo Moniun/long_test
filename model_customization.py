@@ -1,12 +1,18 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from hippo_model import HippoModel
 
 class ModifiedQwen(nn.Module):
     """包装Qwen3-8B并插入自定义模块，支持对话历史记忆融合"""
     def __init__(self, base_model_name_or_path):
         super().__init__()
+        # 加载分词器
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            base_model_name_or_path,
+            trust_remote_code=True
+        )
+        
         # 加载基础模型（4-bit量化）
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -67,61 +73,82 @@ class ModifiedQwen(nn.Module):
             dialog_histories: 对话历史列表，格式为[["句子1", "句子2"], ["句子3", "句子4", "句子5"], ...]
         """
         # 第一步：处理对话历史，通过HippoModel获取记忆表示
-        if dialog_histories is not None and len(dialog_histories) > 0:
-            # 将对话历史输入HippoModel，得到记忆表示
-            # dialog_histories格式：[(batch_size,)]，每个元素是对话句子列表
-            memory_representations = self.hippo_model(dialog_histories)
-            # memory_representations形状: (batch_size, hidden_size)
-        else:
-            # 如果没有对话历史，使用零向量
-            batch_size = input_ids.shape[0] if input_ids is not None else 1
-            memory_representations = torch.zeros(batch_size, self.hidden_size, 
-                                               device=self.base_model.device, 
-                                               dtype=torch.float32)
+        # 获取大模型的词嵌入层
+        embedding_layer = self.base_model.transformer.wte
+        
+        # 处理每个样本的对话历史
+        batch_embedded_histories = []
+        for sample_history in dialog_histories:
+            if not sample_history:  # 空对话历史
+                # 创建零向量作为占位符
+                embedded_dialog = torch.zeros(1, 1, self.hidden_size, 
+                                            device=self.base_model.device)
+                batch_embedded_histories.append(embedded_dialog)
+            else:
+                # 对每个句子应用embedding
+                embedded_sentences = []
+                for sentence in sample_history:
+                    # 使用大模型的分词器处理句子
+                    tokens = self.tokenizer(sentence, return_tensors="pt", 
+                                            truncation=True, max_length=512)
+                    sent_input_ids = tokens.input_ids.to(self.base_model.device)
+                    
+                    # 使用大模型的embedding层
+                    embedded = embedding_layer(sent_input_ids)
+                    embedded_sentences.append(embedded)
+                
+                # 将同一样本的所有句子嵌入拼接起来
+                if embedded_sentences:
+                    # 形状: (num_sentences, seq_len, hidden_size)
+                    embedded_dialog = torch.cat(embedded_sentences, dim=0)
+                    # 添加样本维度: (1, num_sentences, seq_len, hidden_size)
+                    embedded_dialog = embedded_dialog.unsqueeze(0)
+                    batch_embedded_histories.append(embedded_dialog)
+        
+        # 将对话历史输入HippoModel，得到记忆表示
+        # 输入形状: (batch_size, num_sentences, seq_len, hidden_size)
+        memory_representations = self.hippo_model(batch_embedded_histories)
+        # memory_representations形状: (batch_size, hidden_size)
         
         # 第二步：将memory_query输入大模型，获取最后一层Transformer的输出
-        if input_ids is not None:
-            # 获取基础模型输出（包含隐藏状态）
-            outputs = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                output_hidden_states=True
-            )
-            
-            # 获取最后一层Transformer的输出（MLP的原始输入）
-            last_hidden = outputs.hidden_states[-1]  # 形状: (batch_size, seq_len, hidden_size)
-            
-            # 第三步：在最后一个MLP层之前，融合HippoModel的输出
-            # 将记忆表示扩展为序列长度，以便与每个位置的隐藏状态相加
-            # (batch_size, hidden_size) -> (batch_size, seq_len, hidden_size)
-            expanded_memory = memory_representations.unsqueeze(1).expand(-1, last_hidden.shape[1], -1)
-            
-            # 应用LayerNorm（使用模型现有的LayerNorm）
-            ln_output = self.target_mlp_layer.ln_2(last_hidden)
-            
-            # 融合特征：将HippoModel的输出与MLP层的输入相加
-            fused_input = ln_output + expanded_memory
-            
-            # 第四步：将融合后的输入送入MLP层
-            mlp_output = self.target_mlp_layer.mlp(fused_input)
-            
-            # 应用残差连接
-            final_output = last_hidden + mlp_output
-            
-            # 计算logits
-            logits = self.base_model.lm_head(final_output)
-            
-            # 构造输出对象
-            return type(outputs)(
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions
-            )
-        else:
-            # 如果只有对话历史输入，仅返回HippoModel的输出
-            return memory_representations
+        # 获取基础模型输出（包含隐藏状态）
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            output_hidden_states=True
+        )
+        
+        # 获取最后一层Transformer的输出（MLP的原始输入）
+        last_hidden = outputs.hidden_states[-1]  # 形状: (batch_size, seq_len, hidden_size)
+        
+        # 第三步：在最后一个MLP层之前，融合HippoModel的输出
+        # 将记忆表示扩展为序列长度，以便与每个位置的隐藏状态相加
+        # (batch_size, hidden_size) -> (batch_size, seq_len, hidden_size)
+        expanded_memory = memory_representations.unsqueeze(1).expand(-1, last_hidden.shape[1], -1)
+        
+        # 应用LayerNorm（使用模型现有的LayerNorm）
+        ln_output = self.target_mlp_layer.ln_2(last_hidden)
+        
+        # 融合特征：将HippoModel的输出与MLP层的输入相加
+        fused_input = ln_output + expanded_memory
+        
+        # 第四步：将融合后的输入送入MLP层
+        mlp_output = self.target_mlp_layer.mlp(fused_input)
+        
+        # 应用残差连接
+        final_output = last_hidden + mlp_output
+        
+        # 计算logits
+        logits = self.base_model.lm_head(final_output)
+        
+        # 构造输出对象
+        return type(outputs)(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions
+        )
 
     def generate(self, *args, **kwargs):
         """包装生成函数，保持原始接口"""

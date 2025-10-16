@@ -44,7 +44,7 @@ class HippoModel(nn.Module):
         # 编码器（替代传统Hippo中的B矩阵）：将文本嵌入映射到隐藏状态空间
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, middle_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(middle_dim, hidden_dim)
         ).to(self.device)
                 
@@ -58,7 +58,7 @@ class HippoModel(nn.Module):
             'layer_norm1': nn.LayerNorm(middle_dim),  # 归一化
             'ffn': nn.Sequential(  # 前馈网络
                 nn.Linear(middle_dim, ffn_dim),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Linear(ffn_dim, output_dim)
             ),
             'layer_norm2': nn.LayerNorm(output_dim),  # 输出归一化
