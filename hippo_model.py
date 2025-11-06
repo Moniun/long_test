@@ -1,121 +1,92 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.special import legendre, laguerre
-from sentence_transformers import SentenceTransformer
-from typing import List, Union
+from typing import Optional
 
 
 class HippoModel(nn.Module):
     def __init__(self, 
-                 input_dim: int = 384, 
-                 hidden_dim: int = 128, 
-                 hippo_type: str = "LegS", 
-                 middle_dim: int = 1024, 
-                 ffn_dim: int = 512, 
-                 output_dim: int = 512,
-                 text_encoder_name: str = 'all-MiniLM-L6-v2'):  # 允许自定义文本编码器
+                 input_dim: int = 4096,  # 输入维度（通常为大模型隐藏层维度）
+                 hidden_dim: int = 16,   # 隐藏状态维度
+                 hippo_type: str = "LegS",  # Hippo矩阵类型
+                 ffn_dim: int = 4096*2,     # 前馈网络维度
+                 output_dim: int = 4096):  # 输出维度
         """
-        基于Hippo矩阵的序列建模模型，用于处理变长文本序列并生成固定维度输出
+        Hippo模型的基础实现，基于选择性状态空间模型(SSM)的序列建模
         
         参数:
-            input_dim: 文本嵌入的维度（与text_encoder输出匹配）
+            input_dim: 输入向量的维度
             hidden_dim: 隐藏状态h的维度
             hippo_type: Hippo矩阵类型，支持'LegT', 'LagT', 'LegS'
-            middle_dim: 编码器/解码器中间层维度
-            ffn_dim: 解码器FFN层维度
+            ffn_dim: 前馈网络中间层维度
             output_dim: 最终输出维度
-            text_encoder_name: 文本编码器模型名或本地路径
         """
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         # 核心参数
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.hippo_type = hippo_type
-        self.middle_dim = middle_dim
         self.ffn_dim = ffn_dim
         self.output_dim = output_dim
         
         # 初始化Hippo矩阵（A）：用于隐藏状态的时序更新
         A_np = self._create_hippo_matrix(hidden_dim, hippo_type)
-        self.A = nn.Parameter(torch.tensor(A_np, dtype=torch.float32, device=self.device))  # 注册为可学习参数
-
-        # 编码器（替代传统Hippo中的B矩阵）：将文本嵌入映射到隐藏状态空间
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, middle_dim),
+        self.A = nn.Parameter(torch.tensor(A_np, dtype=torch.float32, device=self.device))
+        
+        # 基础投影层，用于动态生成SSM参数
+        self.b_proj = nn.Linear(input_dim, hidden_dim).to(self.device)
+        self.c_proj = nn.Linear(input_dim, hidden_dim * output_dim).to(self.device)
+        self.d_proj = nn.Linear(input_dim, output_dim).to(self.device)
+        
+        # GLU门控机制
+        self.b_gate = nn.Linear(input_dim, hidden_dim).to(self.device)
+        self.c_gate = nn.Linear(input_dim, hidden_dim * output_dim).to(self.device)
+        
+        # 前馈网络
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, ffn_dim),
             nn.GELU(),
-            nn.Linear(middle_dim, hidden_dim)
+            nn.Linear(ffn_dim, input_dim)
         ).to(self.device)
-                
-        # 文本编码器：将原始文本转为向量（使用预训练模型）
-        self.text_encoder = SentenceTransformer(text_encoder_name).to(self.device)
         
-        
-        # 解码器：将最终隐藏状态映射到输出维度
-        self.decoder = nn.ModuleDict({
-            'input_proj': nn.Linear(hidden_dim, middle_dim),  # 隐藏状态投影
-            'layer_norm1': nn.LayerNorm(middle_dim),  # 归一化
-            'ffn': nn.Sequential(  # 前馈网络
-                nn.Linear(middle_dim, ffn_dim),
-                nn.GELU(),
-                nn.Linear(ffn_dim, output_dim)
-            ),
-            'layer_norm2': nn.LayerNorm(output_dim),  # 输出归一化
-            'output_layer': nn.Linear(output_dim, output_dim)  # 最终映射
-        }).to(self.device)
-        
+        # 层归一化
+        self.norm1 = nn.LayerNorm(input_dim).to(self.device)
+        self.norm2 = nn.LayerNorm(input_dim).to(self.device)
+    
     def _create_hippo_matrix(self, n: int, type_: str) -> np.ndarray:
         """
-        创建指定类型的Hippo矩阵（用于捕获时序依赖）
+        创建基础的Hippo对角矩阵A，用于SSM计算
         
         参数:
             n: 矩阵维度（与hidden_dim一致）
-            type_: 多项式类型，决定矩阵结构
+            type_: 多项式类型
         返回:
-            形状为(n, n)的Hippo矩阵（numpy数组）
+            对角向量
         """
-        A = np.zeros((n, n), dtype=np.float32)  # 预分配内存，指定float32类型
+        # 基础对角线初始化
+        diag = np.zeros(n, dtype=np.float32)
+        
         if type_ == 'LegT':
-            # Legendre多项式变换矩阵（在[-1,1]区间采样）
-            for i in range(n):
-                P = legendre(i)  # 获取i次Legendre多项式
-                for j in range(n):
-                    A[i, j] = P(j / (n - 1) * 2 - 1)  # 坐标映射到[-1,1]
-        elif type_ == 'LagT':
-            # Laguerre多项式变换矩阵（在正整数点采样）
-            for i in range(n):
-                L = laguerre(i)  # 获取i次Laguerre多项式
-                for j in range(n):
-                    A[i, j] = L(j + 1)  # 正整数输入
+            # Legendre Type T
+            for k in range(1, n+1):
+                diag[k-1] = -np.pi * (k - 0.5)**2 / 4.0
         elif type_ == 'LegS':
-            # 带权重的Legendre多项式（对称形式）
-            for i in range(n):
-                P = legendre(i)
-                for j in range(n):
-                    A[i, j] = P(2 * j / n - 1) * np.sqrt(2 * i + 1)  # 加权归一化
+            # Legendre Type S
+            for k in range(1, n+1):
+                diag[k-1] = -k**2 * np.pi**2 / 4.0
+        elif type_ == 'LagT':
+            # Laguerre多项式
+            for k in range(1, n+1):
+                diag[k-1] = -k * 2.0
         else:
             raise ValueError(f"不支持的Hippo矩阵类型: {type_}，可选类型: 'LegT', 'LagT', 'LegS'")
-        return A
-
-    def encode_text(self, text: Union[str, List[str]]) -> torch.Tensor:
-        """
-        将文本或文本列表编码为向量
         
-        参数:
-            text: 单个文本字符串或文本列表
-        返回:
-            编码后的张量，形状为(seq_len, input_dim)（列表输入）或(input_dim,)（单文本）
-        """
-        # 统一输入格式为列表（适配SentenceTransformer的encode方法）
-        if isinstance(text, str):
-            texts = [text]
-        else:
-            texts = text
+        # 确保对角线元素都是负数，保证数值稳定性
+        diag = np.minimum(diag, -1e-6)
         
-        # 编码并转换为张量（确保与模型在同一设备）
-        vecs = self.text_encoder.encode(texts, convert_to_tensor=True, device=self.device)  # (seq_len, input_dim)
-        return vecs  # 与Hippo矩阵A保持设备一致
+        return diag
 
     def reset_h(self, batch_size: int) -> torch.Tensor:
         """
@@ -124,99 +95,145 @@ class HippoModel(nn.Module):
         参数:
             batch_size: 批次大小
         返回:
-            形状为(batch_size, hidden_dim)的初始隐藏状态（全0）
+            形状为(batch_size, hidden_dim)的初始隐藏状态
         """
         return torch.zeros(
             batch_size, self.hidden_dim, 
             dtype=torch.float32, 
-            device=self.device  # 确保与模型设备一致
-        )
-
-    def forward(self, batch_seqs: List[List[str]]) -> torch.Tensor:
-        """
-        处理批次变长文本序列，生成最终输出
-        
-        参数:
-            batch_seqs: 批次数据，形状为(batch_size, )，每个元素是文本列表
-                        示例: [["第一步", "第二步"], ["用户输入1", "用户输入2", "用户输入3"], ...]
-        返回:
-            批次中每个样本的最终输出，形状为(batch_size, output_dim)
-        """
-        # -------------------------- 输入校验 --------------------------
-        if not isinstance(batch_seqs, list) or not all(isinstance(seq, list) for seq in batch_seqs):
-            raise ValueError("输入必须是列表的列表，例如: [['text1', 'text2'], ['text3']]")
-        batch_size = len(batch_seqs)
-        if batch_size == 0:
-            raise ValueError("批次不能为空")
-        
-        # -------------------------- 文本编码与预处理 --------------------------
-        # 1. 编码所有序列并记录长度（处理变长序列）
-        encoded_seqs = []  # 存储每个样本的编码结果
-        seq_lens = []      # 存储每个样本的序列长度
-        for seq in batch_seqs:
-            encoded = self.encode_text(seq)  # (seq_len, input_dim)
-            encoded_seqs.append(encoded)
-            seq_lens.append(encoded.shape[0])
-        max_seq_len = max(seq_lens)  # 批次内最大序列长度
-        
-        # 2. 对序列进行padding（统一长度以便批量处理）
-        # 形状: (batch_size, max_seq_len, input_dim)
-        padded_x = torch.zeros(
-            batch_size, max_seq_len, self.input_dim,
-            dtype=torch.float32,
             device=self.device
         )
-        for i, seq in enumerate(encoded_seqs):
-            padded_x[i, :seq_lens[i]] = seq  # 仅填充有效序列部分
+
+    def selective_scan(self, B: torch.Tensor, C: torch.Tensor, A: torch.Tensor, h_initial: torch.Tensor) -> torch.Tensor:
+        """
+        Mamba基础选择性扫描操作
         
-        # 3. 通过编码器生成Bx（形状: (batch_size, max_seq_len, hidden_dim)）
-        seqs_Bx = self.encoder(padded_x)
+        参数:
+            B: 形状为(batch_size, seq_len, hidden_dim)的输入矩阵
+            C: 形状为(batch_size, seq_len, hidden_dim, output_dim)的输出矩阵
+            A: 形状为(hidden_dim,)的对角向量
+            h_initial: 形状为(batch_size, hidden_dim)的初始隐藏状态
+        返回:
+            形状为(batch_size, seq_len, output_dim)的输出序列
+        """
+        device = B.device
         
-        # -------------------------- 隐藏状态更新（核心优化） --------------------------
-        # 初始化隐藏状态: (batch_size, hidden_dim)
-        batch_h = self.reset_h(batch_size)
+        # 计算指数衰减因子 (hidden_dim,) -> (1, 1, hidden_dim) 用于广播
+        delta = torch.exp(A).view(1, 1, hidden_dim)
         
-        # 向量化更新：按时间步循环（替代原有的样本+时间步双重循环）
-        # 对每个时间步t，仅更新序列长度>t的样本
-        for t in range(max_seq_len):
-            # 掩码：标记哪些样本在当前时间步t有有效数据（形状: (batch_size,)）
-            mask = torch.tensor([t < seq_len for seq_len in seq_lens], device=self.device)
+        # 构造时间步索引和累积衰减矩阵，替代循环中的逐步衰减计算
+        t = torch.arange(seq_len, device=device).view(1, -1, 1)  # 时间步索引 (1, seq_len, 1)
+        decay = delta ** t  # 基础衰减因子 (1, seq_len, hidden_dim)
+        # 用三角矩阵掩码实现"仅累加过去时间步"（t >= s）
+        decay = decay * torch.triu(torch.ones(seq_len, seq_len, device=device)).view(1, seq_len, seq_len)
+        
+        # 向量化计算B的贡献：替代循环中h_prev = h_prev * delta + B[:, t]的累积
+        B_expanded = B.unsqueeze(1)  # (batch, 1, seq_len, hidden)
+        decay_expanded = decay.unsqueeze(-1)  # (1, seq_len, seq_len, 1)
+        B_contrib = (B_expanded * decay_expanded).sum(dim=2)  # 并行累加所有过去时间步的贡献
+        
+        # 向量化计算初始状态的贡献：替代循环中初始状态的逐步衰减
+        h_initial_contrib = h_initial.unsqueeze(1) * (delta ** t)  # (batch, seq_len, hidden)
+        
+        # 总隐藏状态（合并初始状态和B的贡献）
+        h = h_initial_contrib + B_contrib
+        
+        # 用einsum高效计算输出：替代循环中的矩阵乘法
+        output = torch.einsum('bth, btho -> bto', h, C)  # (batch, seq_len, output_dim)
+        
+        return output
+    # def selective_scan(self, B: torch.Tensor, C: torch.Tensor, A: torch.Tensor, h_initial: torch.Tensor) -> torch.Tensor:
+        
+    #     batch_size, seq_len, hidden_dim = B.shape
+    #     output_dim = C.shape[-1]  # 获取输出维度
+    #     device = B.device
+        
+    #     # 计算delta值（指数衰减因子）
+    #     delta = torch.exp(A)  # 形状为(hidden_dim,)
+        
+    #     # 初始化隐藏状态
+    #     h_prev = h_initial.to(device=device, dtype=B.dtype)
+        
+    #     # 预分配输出张量
+    #     outputs = torch.zeros(batch_size, seq_len, output_dim, device=device, dtype=B.dtype)
+        
+    #     # 执行选择性扫描
+    #     for t in range(seq_len):
+    #         # 更新隐藏状态: h_t = h_{t-1} * delta + B_t
+    #         h_curr = h_prev * delta + B[:, t]
             
-            # 提取当前时间步的Bx（形状: (batch_size, hidden_dim)）
-            current_Bx = seqs_Bx[:, t, :]
-            
-            # 批量更新隐藏状态：h = A @ h + Bx（仅对有效样本更新）
-            # A.unsqueeze(0) 扩展为(1, hidden_dim, hidden_dim)，支持批次矩阵乘法
-            updated_h = torch.bmm(self.A.unsqueeze(0).expand(batch_size, -1, -1), batch_h.unsqueeze(-1)).squeeze(-1)
-            updated_h = updated_h + current_Bx  # 加上当前时间步的输入
-            
-            # 用掩码选择是否更新（无效样本保持原状态）
-            batch_h = torch.where(mask.unsqueeze(1), updated_h, batch_h)
+    #         # 2. 计算当前输出：y_t = C_t · h_t（矩阵乘法）
+    #         # C[:, t]形状：(batch_size, hidden_dim, output_dim)
+    #         # h_curr.unsqueeze(1)形状：(batch_size, 1, hidden_dim)
+    #         # 矩阵乘法结果：(batch_size, 1, output_dim)，挤压后为(batch_size, output_dim)
+    #         outputs[:, t] = torch.matmul(h_curr.unsqueeze(1), C[:, t]).squeeze(1)
+    #         # 准备下一次迭代
+    #         h_prev = h_curr
         
-        # -------------------------- 解码最终隐藏状态 --------------------------
-        # 1. 投影与归一化
-        projected_h = self.decoder['input_proj'](batch_h)  # (batch_size, middle_dim)
-        norm_h = self.decoder['layer_norm1'](projected_h)
+    #     return outputs
+
+    def forward(self, 
+                batch_vectors: torch.Tensor, 
+                h_initial: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Mamba模型的前向传播
         
-        # 2. FFN与残差连接
-        ffn_output = self.decoder['ffn'](norm_h) + projected_h  # 残差连接增强梯度传播
-        norm_ffn_output = self.decoder['layer_norm2'](ffn_output)
+        参数:
+            batch_vectors: 形状为(batch_size, seq_len, hidden_size)的张量
+        返回:
+            批次中每个样本的最终输出，形状为(batch_size, seq_len, output_dim)
+        """
+        # 输入验证与设备强制对齐，避免设备不匹配错误
+        if not isinstance(batch_vectors, torch.Tensor) or batch_vectors.dim() != 3:
+            raise ValueError("输入必须是形状为(batch_size, seq_len, input_dim)的张量")
+        batch_vectors = batch_vectors.to(self.device)  # 强制输入到模型设备
+        batch_size, seq_len, _ = batch_vectors.size()
         
-        # 3. 最终输出
-        final_output = self.decoder['output_layer'](norm_ffn_output)  # (batch_size, output_dim)
+        # 支持流式隐藏状态初始化：允许传入上一轮的隐藏状态
+        if h_initial is None:
+            h_initial = self.reset_h(batch_size)
+        else:
+            # 验证隐藏状态形状，增强鲁棒性
+            if h_initial.shape != (batch_size, self.hidden_dim):
+                raise ValueError(f"h_initial形状应为({batch_size}, {self.hidden_dim})，实际为{h_initial.shape}")
+            h_initial = h_initial.to(self.device, dtype=batch_vectors.dtype)  # 设备和类型对齐
         
-        return final_output
+        # 层归一化
+        x = self.norm1(batch_vectors)
+        
+        # 生成SSM参数（带GLU门控）
+        B = self.b_proj(x) * torch.sigmoid(self.b_gate(x))  # (batch, seq_len, hidden_dim)
+        C_proj = self.c_proj(x) * torch.sigmoid(self.c_gate(x))  # (batch, seq_len, hidden_dim*output_dim)
+        # 将C_proj拆分为矩阵形状，匹配selective_scan的输入要求
+        C = C_proj.reshape(batch_size, seq_len, self.hidden_dim, self.output_dim)
+        D = self.d_proj(x)  # (batch, seq_len, output_dim)
+        
+        # 执行选择性扫描（向量化实现）
+        ssm_output = self.selective_scan(B, C, self.A, h_initial)
+        ssm_output = ssm_output + D  # 结合偏置项
+        
+        # 残差连接
+        x = batch_vectors + ssm_output
+        
+        # 前馈网络处理
+        x = self.norm2(x)
+        ffn_out = self.ffn(x)
+        x = x + ffn_out  # 残差连接
+        
+        # 计算最终隐藏状态（用于流式处理）：避免存储完整h序列，直接公式计算最后一步
+        last_h = h_initial * (torch.exp(self.A) ** seq_len) + \
+                 torch.sum(B * (torch.exp(self.A) ** (seq_len - 1 - torch.arange(seq_len, device=self.device))).view(1, -1, 1), dim=1)
+        
+        # 返回输出和最终隐藏状态，支持链式流式调用
+        return x, last_h
 
 
-# 使用示例（取消注释可运行）
+# 使用示例
 if __name__ == "__main__":
     # 初始化模型
     model = HippoModel()
-    # 示例输入：2个样本，分别包含2个和3个文本
-    batch_seqs = [
-        ["这是第一个样本的第一句话", "这是第一个样本的第二句话"],
-        ["第二个样本的第一句", "第二句", "第三句"]
-    ]
+    # 创建示例张量输入：批次大小为2，序列长度为3，输入维度为4096
+    batch_vectors = torch.randn(2, 3, 4096, device=model.device)
     # 前向传播
-    outputs = model(batch_seqs)
-    print("输出形状:", outputs.shape)  # 应输出 torch.Size([2, 512])
+    outputs = model(batch_vectors)
+    print("输出形状:", outputs.shape)  # 应输出 torch.Size([2, 3, 4096])
+    print("Mamba模型基础功能已成功实现")

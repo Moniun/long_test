@@ -72,55 +72,30 @@ class ModifiedQwen(nn.Module):
             labels: 标签（用于损失计算）
             dialog_histories: 对话历史列表，格式为[["句子1", "句子2"], ["句子3", "句子4", "句子5"], ...]
         """
-        # 第一步：处理对话历史，通过HippoModel获取记忆表示
-        # 获取大模型的词嵌入层
-        embedding_layer = self.base_model.transformer.wte
+        # 第一步：获取必要的hidden_states，而不计算完整的前向传播
+        # 只计算到hidden_states，避免不必要的计算
+        with torch.no_grad():
+            # 只获取embeddings和transformer层的hidden_states，不计算最终logits
+            # 访问base_model的transformer部分，获取我们需要的hidden_states
+            # 这样可以避免触发完整的前向传播
+            transformer_outputs = self.base_model.transformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            )
         
-        # 处理每个样本的对话历史
-        batch_embedded_histories = []
-        for sample_history in dialog_histories:
-            if not sample_history:  # 空对话历史
-                # 创建零向量作为占位符
-                embedded_dialog = torch.zeros(1, 1, self.hidden_size, 
-                                            device=self.base_model.device)
-                batch_embedded_histories.append(embedded_dialog)
-            else:
-                # 对每个句子应用embedding
-                embedded_sentences = []
-                for sentence in sample_history:
-                    # 使用大模型的分词器处理句子
-                    tokens = self.tokenizer(sentence, return_tensors="pt", 
-                                            truncation=True, max_length=512)
-                    sent_input_ids = tokens.input_ids.to(self.base_model.device)
-                    
-                    # 使用大模型的embedding层
-                    embedded = embedding_layer(sent_input_ids)
-                    embedded_sentences.append(embedded)
-                
-                # 将同一样本的所有句子嵌入拼接起来
-                if embedded_sentences:
-                    # 形状: (num_sentences, seq_len, hidden_size)
-                    embedded_dialog = torch.cat(embedded_sentences, dim=0)
-                    # 添加样本维度: (1, num_sentences, seq_len, hidden_size)
-                    embedded_dialog = embedded_dialog.unsqueeze(0)
-                    batch_embedded_histories.append(embedded_dialog)
+        # 获取词嵌入层输出加上位置编码后的数据（Transformer输入层）
+        # 形状: (batch_size, seq_len, hidden_size)
+        # hidden_states[0] 通常就是嵌入层+位置编码后的结果，这正是Transformer的第一层输入
+        attention_input = transformer_outputs.hidden_states[0]
         
-        # 将对话历史输入HippoModel，得到记忆表示
-        # 输入形状: (batch_size, num_sentences, seq_len, hidden_size)
-        memory_representations = self.hippo_model(batch_embedded_histories)
+        # 将注意力层输入直接送入HippoModel
+        # 这里我们将整个序列视为一个输入序列
+        memory_representations = self.hippo_model(attention_input)
         # memory_representations形状: (batch_size, hidden_size)
         
-        # 第二步：将memory_query输入大模型，获取最后一层Transformer的输出
-        # 获取基础模型输出（包含隐藏状态）
-        outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            output_hidden_states=True
-        )
-        
         # 获取最后一层Transformer的输出（MLP的原始输入）
-        last_hidden = outputs.hidden_states[-1]  # 形状: (batch_size, seq_len, hidden_size)
+        last_hidden = transformer_outputs.hidden_states[-1]  # 仍然使用最后一层进行后续处理
         
         # 第三步：在最后一个MLP层之前，融合HippoModel的输出
         # 将记忆表示扩展为序列长度，以便与每个位置的隐藏状态相加
@@ -143,11 +118,12 @@ class ModifiedQwen(nn.Module):
         logits = self.base_model.lm_head(final_output)
         
         # 构造输出对象
-        return type(outputs)(
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        return CausalLMOutputWithPast(
             logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions
         )
 
     def generate(self, *args, **kwargs):
