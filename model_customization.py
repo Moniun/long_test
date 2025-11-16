@@ -13,7 +13,7 @@ torch.backends.cudnn.benchmark = True
 
 class ModifiedQwen(nn.Module):
     """包装Qwen3-8B并插入单个HippoModel，在transformer层间进行门控融合"""
-    def __init__(self, base_model_name_or_path, fusion_layers=None, cache_dir="qwen3-8b-custom-module-training"):
+    def __init__(self, base_model_name_or_path, fusion_layers=None, cache_dir="qwen3-8b-custom-module-training", last_n_tokens=0):
         super().__init__()
         # 加载分词器
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -39,6 +39,9 @@ class ModifiedQwen(nn.Module):
         
         # 默认融合层位置（均匀分布在模型层中）
         self.fusion_layers = fusion_layers if fusion_layers is not None else [0]
+        
+        # 添加last_n_tokens参数，控制Hippo模型处理的token数量
+        self.last_n_tokens = last_n_tokens
         
         # 添加融合层索引越界校验
         for layer_idx in self.fusion_layers:
@@ -284,13 +287,13 @@ class ModifiedQwen(nn.Module):
                     # 计算历史嵌入（仅词嵌入，不需要位置编码，因为历史对话不经过Qwen的transformer层）
                     history_embeds = self.base_model.model.embed_tokens(history_batch)
                     
-                    # 更新Hippo隐藏状态
-                    _, h_initial = self.hippo_model(history_embeds, h_initial)
+                    # 更新Hippo隐藏状态，传入last_n_tokens参数
+                    _, h_initial = self.hippo_model(history_embeds, h_initial, last_n_tokens=self.last_n_tokens)
                     self.hidden_h = h_initial
 
         # 使用Hippo模型处理第一层transformer的输入，传入更新后的隐藏状态
         # 始终计算梯度，但只有在非冻结时才会更新参数
-        hippo_output, self.hidden_h = self.hippo_model(hidden_states, self.hidden_h)
+        hippo_output, self.hidden_h = self.hippo_model(hidden_states, self.hidden_h, last_n_tokens=self.last_n_tokens)
         
         # 初始化past_key_values存储
         past_key_values = []
@@ -400,14 +403,42 @@ class ModifiedQwen(nn.Module):
             # 调用基础模型的generate方法，它会使用我们重写的forward方法
             return self.base_model.generate(*args, **kwargs)
     
-    def save_pretrained(self, save_directory):
+    def save_pretrained(self, save_directory, model_type="full"):
         """自定义保存方法，确保所有子模块参数都能正确保存，同时优化内存使用"""
         import os
         
         # 清理GPU缓存以节省内存
         torch.cuda.empty_cache()
         
-        # 创建保存目录
+        # 根据模型类型设置保存路径
+        if model_type == "hippo":
+            # 只保存Hippo相关组件
+            hippo_dir = os.path.join(save_directory, "hippo_model")
+            os.makedirs(hippo_dir, exist_ok=True)
+            
+            # 保存Hippo组件
+            custom_state_dict = {
+                'hippo_model': self.hippo_model.state_dict(),
+                'gate_mechanisms': self.gate_mechanisms.state_dict(),
+                'fusion_layers': self.fusion_layers,
+                'current_stage': self.current_stage
+            }
+            torch.save(custom_state_dict, os.path.join(hippo_dir, 'hippo_components.bin'))
+            
+            # 保存配置
+            config = {
+                'base_model_name_or_path': self.base_model_name_or_path,
+                'fusion_layers': self.fusion_layers,
+                'model_type': 'hippo_full_param',
+                'base_model_config': self.base_model.config.__dict__ if hasattr(self.base_model, 'config') else {}
+            }
+            with open(os.path.join(hippo_dir, 'config.json'), 'w') as f:
+                json.dump(config, f, indent=2)
+                
+            print(f"Hippo组件已保存至: {hippo_dir}")
+            return
+        
+        # 完整模型保存（适用于full_parameter_finetuning目录）
         os.makedirs(save_directory, exist_ok=True)
         
         # 保存基础模型
@@ -425,7 +456,7 @@ class ModifiedQwen(nn.Module):
         }
         torch.save(custom_state_dict, os.path.join(save_directory, 'custom_modules.bin'))
         
-        print(f"模型已保存至: {save_directory}")
+        print(f"完整模型已保存至: {save_directory}")
         print(f"- 基础模型参数")
         print(f"- Hippo模型参数")
         print(f"- 门控机制参数")
