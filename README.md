@@ -113,7 +113,7 @@ python train.py
 训练将自动加载`data/data_train.jsonl`作为训练集和`data/data_val.jsonl`作为验证集，并将模型保存到`./models`目录。
 
 可选参数配置：
-- `--model_name_or_path`: 预训练模型路径，默认为"Qwen/Qwen3-8B-Chat"
+- `--model_name_or_path`: 预训练模型路径，默认为"Qwen"
 - `--data_path`: 训练数据路径，默认为"data/data_train.jsonl"
 - `--test_data_path`: 验证数据路径，默认为"data/data_val.jsonl"
 - `--base_output_dir`: 基础模型保存路径，默认为"./models"
@@ -189,9 +189,7 @@ python train.py \
   
 ```bash
 # 使用LoRA微调模型进行推理
-python inference.py \
-    --model_path "./models/lora_finetuning" \
-    --tokenizer_path "./models/lora_finetuning/tokenizer"
+python inference.py --model_path "./models/lora_finetuning"
 ```
 
 ### LoRA微调优势
