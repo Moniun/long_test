@@ -20,7 +20,7 @@ from sentence_transformers import util as sentence_transformer_util
 from sentence_transformers.util import cos_sim as calculate_cosine_similarity
 from lora_model_customization import HippoLoRAQwen
 
-
+nltk.download('wordnet')
 # 确保NLTK数据可用
 try:
     nltk.data.path.append("./nltk_data")
@@ -66,7 +66,7 @@ def parse_args():
     
     # 训练参数
     parser.add_argument("--num_train_epochs", type=int, default=2)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=2, help="评估时的batch size（减小以节省内存）")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--eval_accumulation_steps", type=int, default=8, help="评估时的梯度累积步数（增加以模拟更大batch）")
@@ -85,7 +85,7 @@ def parse_args():
     # 评估和日志
     parser.add_argument("--max_length", type=int, default=2048, help="最大序列长度")
     parser.add_argument("--evaluation_strategy", type=str, default="steps", choices=["no", "epoch", "steps"], help="评估策略")
-    parser.add_argument("--eval_steps", type=int, default=20, help="每多少步进行一次评估")
+    parser.add_argument("--eval_steps", type=int, default=32, help="每多少步进行一次评估")
     parser.add_argument("--test_sample_ratio", type=float, default=1.0, help="测试集采样比例，0.0-1.0")
     parser.add_argument("--logging_steps", type=int, default=1, help="日志打印步数")
     parser.add_argument("--save_steps", type=int, default=32, help="模型保存步数")
@@ -109,6 +109,7 @@ class OptimizedTrainer(Trainer):
         self.cmd_args = cmd_args
         self.current_epoch = 0
         self.custom_tokenizer = AutoTokenizer.from_pretrained(cmd_args.model_name_or_path)
+        # self.custom_tokenizer.pad_token = self.custom_tokenizer.eos_token
         # 延迟加载Sentence-BERT模型
         self._sbert_model = get_sbert_model()
 
@@ -121,101 +122,151 @@ class OptimizedTrainer(Trainer):
             self._sbert_model = get_sbert_model()
         return self._sbert_model
     
-    def _compute_metrics(self, eval_pred):
-        """内存优化的评估指标计算"""
+    def _compute_metrics(self, eval_pred, compute_result=False):
+        """内存优化的评估指标计算（支持批次累积）"""
         predictions, labels = eval_pred
+        # print(type(predictions),predictions)
+        # print(type(labels),labels)
+        # ==================== 初始化累积变量（首次调用时） ====================
+        if not hasattr(self, "accumulated_metrics"):
+            self.accumulated_metrics = {
+                # F1相关累积值
+                "true_positives": 0,
+                "predicted_positives": 0,
+                "actual_positives": 0,
+                # METEOR相关累积值（用总和+计数代替列表，节省内存）
+                "meteor_sum": 0.0,
+                "meteor_count": 0,
+                # SBERT相关累积值
+                "sbert_sum": 0.0,
+                "sbert_count": 0,
+                # 总样本数
+                "total_samples": 0
+            }
 
-        # 1. 计算Token级指标（F1相关）
-        predictions = torch.argmax(torch.tensor(predictions), dim=-1)
-        mask = labels != -100  # 过滤无效标签（-100）
-        
-        true_positives = ((predictions == labels) & mask).sum().item()
-        predicted_positives = mask.sum().item()  # 预测的有效位置数
-        actual_positives = mask.sum().item()     # 实际的有效位置数
-        
-        precision = true_positives / predicted_positives if predicted_positives > 0 else 0.0
-        recall = true_positives / actual_positives if actual_positives > 0 else 0.0
-        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-        
-        # 2. 限制评估样本数量以节省内存
-        max_samples = min(len(predictions), self.cmd_args.eval_sample_limit)
-        predictions = predictions[:max_samples]
-        labels = labels[:max_samples]
-        
-        # 3. 计算METEOR和SBERT相似度（仅对限制后的样本）
-        meteor_scores = []
-        sbert_similarities = []
-        
-        batch_size = self.cmd_args.metric_batch_size
-        total_batches = (len(predictions) + batch_size - 1) // batch_size
-        
-        for batch_idx in range(total_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(predictions))
+        # ==================== 中间批次逻辑（累积结果，不返回最终指标） ====================
+        if not compute_result:
+            # 1. 限制单批次样本量（避免超过总限制）
+            max_total_samples = self.cmd_args.eval_sample_limit
+            remaining_samples = max_total_samples - self.accumulated_metrics["total_samples"]
+            if remaining_samples <= 0:
+                return  # 已达样本上限，停止累积
             
-            batch_preds = predictions[start_idx:end_idx]
-            batch_labels = labels[start_idx:end_idx]
-            batch_masks = mask[start_idx:end_idx]
+            current_batch_size = len(predictions)
+            actual_use_samples = min(current_batch_size, remaining_samples)
+            if actual_use_samples < current_batch_size:
+                print(f"批次样本截断：{current_batch_size} -> {actual_use_samples}（总样本已达上限）")
+                predictions = predictions[:actual_use_samples]
+                labels = labels[:actual_use_samples]
+
+            # 2. 计算当前批次的Token级指标（F1相关）
+            predictions = torch.argmax(torch.tensor(predictions), dim=-1)
+            mask = labels != -100  # 过滤无效标签（-100）
             
-            for i in range(len(batch_preds)):
-                pred = batch_preds[i]
-                label = batch_labels[i]
-                msk = batch_masks[i]
+            batch_true_positives = ((predictions == labels) & mask).sum().item()
+            batch_predicted_positives = mask.sum().item()  # 预测的有效位置数
+            batch_actual_positives = mask.sum().item()     # 实际的有效位置数（与预测位置一致，因mask相同）
+            
+            # 3. 累积Token级指标
+            self.accumulated_metrics["true_positives"] += batch_true_positives
+            self.accumulated_metrics["predicted_positives"] += batch_predicted_positives
+            self.accumulated_metrics["actual_positives"] += batch_actual_positives
+            
+            # 4. 处理当前批次的语义级指标（METEOR和SBERT）
+            batch_size = self.cmd_args.metric_batch_size  # 内部小批量处理，减少内存压力
+            total_batch_in_chunk = (len(predictions) + batch_size - 1) // batch_size
+            
+            for chunk_idx in range(total_batch_in_chunk):
+                start = chunk_idx * batch_size
+                end = min(start + batch_size, len(predictions))
+                chunk_preds = predictions[start:end]
+                chunk_labels = labels[start:end]
+                chunk_masks = mask[start:end]
                 
-                # 过滤无效位置，解码文本
-                valid_pred_ids = pred[msk].tolist()
-                valid_label_ids = label[msk].tolist()
-                
-                try:
+                for i in range(len(chunk_preds)):
+                    pred = chunk_preds[i]
+                    label = chunk_labels[i]
+                    msk = chunk_masks[i]
+                    
+                    # 过滤无效位置，解码文本
+                    valid_pred_ids = pred[msk].tolist()
+                    valid_label_ids = label[msk].tolist()
+                    
                     pred_text = self.custom_tokenizer.decode(valid_pred_ids, skip_special_tokens=True).strip()
                     label_text = self.custom_tokenizer.decode(valid_label_ids, skip_special_tokens=True).strip()
                     
                     if not (pred_text and label_text):
                         continue  # 跳过空文本
                     
-                    # 计算METEOR
+                    # 计算METEOR并累积
                     pred_tokens = pred_text.split()
                     label_tokens = label_text.split()
                     if pred_tokens and label_tokens:
                         try:
+                            # print(label_tokens)
+                            # print("pred:",pred_tokens)
                             meteor = meteor_score([label_tokens], pred_tokens)
-                            meteor_scores.append(meteor)
+                            self.accumulated_metrics["meteor_sum"] += meteor
+                            self.accumulated_metrics["meteor_count"] += 1
                         except Exception:
-                            pass
+                            raise ValueError("计算METEOR出错")
+                            # continue
                     
-                    # 计算SBERT相似度
+                    # 计算SBERT相似度并累积
                     try:
                         pred_embedding = self._sbert_model.encode(pred_text, convert_to_tensor=True)
                         label_embedding = self._sbert_model.encode(label_text, convert_to_tensor=True)
                         similarity = calculate_cosine_similarity(pred_embedding, label_embedding).item()
-                        sbert_similarities.append(similarity)
+                        self.accumulated_metrics["sbert_sum"] += similarity
+                        self.accumulated_metrics["sbert_count"] += 1
                         
                         # 及时释放显存
                         del pred_embedding, label_embedding
+                        torch.cuda.empty_cache()
                     except Exception:
-                        pass
-                        
-                except Exception:
-                    continue
-        
-        # 计算平均值
-        avg_meteor = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0.0
-        avg_sbert = sum(sbert_similarities) / len(sbert_similarities) if sbert_similarities else 0.0
-        
-        # 输出评估结果
-        print(f"\n===== 评估结果 (Epoch {self.current_epoch}) =====")
-        print(f"- F1分数 (Token级): {f1_score:.4f}")
-        print(f"- METEOR分数 (语义级): {avg_meteor:.4f}")
-        print(f"- Sentence-BERT相似度 (语义级): {avg_sbert:.4f}")
-        print(f"- 评估样本数: {len(predictions)}")
-        print("====================\n")
-        
-        # 返回最终指标
-        return {
-            "f1": f1_score,
-            "meteor": avg_meteor,
-            "sbert_similarity": avg_sbert
-        }
+                        raise ValueError("计算SBERT相似度出错")
+                        # continue
+            
+            # 5. 累积总样本数
+            self.accumulated_metrics["total_samples"] += actual_use_samples
+            return  # 中间批次不返回指标
+
+        # ==================== 最后批次逻辑（汇总计算最终指标） ====================
+        else:
+            # 1. 从累积结果计算全局F1
+            tp = self.accumulated_metrics["true_positives"]
+            pp = self.accumulated_metrics["predicted_positives"]
+            ap = self.accumulated_metrics["actual_positives"]
+            
+            precision = tp / pp if pp > 0 else 0.0
+            recall = tp / ap if ap > 0 else 0.0
+            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            
+            # 2. 计算全局METEOR和SBERT平均
+            avg_meteor = (self.accumulated_metrics["meteor_sum"] / self.accumulated_metrics["meteor_count"]
+                            if self.accumulated_metrics["meteor_count"] > 0 else 0.0)
+            
+            avg_sbert = (self.accumulated_metrics["sbert_sum"] / self.accumulated_metrics["sbert_count"]
+                            if self.accumulated_metrics["sbert_count"] > 0 else 0.0)
+            
+            # 3. 输出评估结果
+            print(f"\n===== 评估结果 (Epoch {self.current_epoch}) =====")
+            print(f"- F1分数 (Token级): {f1_score:.4f}")
+            print(f"- METEOR分数 (语义级): {avg_meteor:.4f}")
+            print(f"- Sentence-BERT相似度 (语义级): {avg_sbert:.4f}")
+            print(f"- 评估样本数: {self.accumulated_metrics['total_samples']}")
+            print(f"METEOR有效样本数: {self.accumulated_metrics['meteor_count']}")
+            print("====================\n")
+            
+            # 4. 重置累积变量（避免影响下一次评估）
+            del self.accumulated_metrics
+            
+            # 5. 返回最终指标
+            return {
+                "f1": f1_score,
+                "meteor": avg_meteor,
+                "sbert_similarity": avg_sbert
+            }
     
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """内存优化的评估流程"""
@@ -358,7 +409,19 @@ def main():
     class CustomDataCollator(DataCollatorForLanguageModeling):
         def __call__(self, features):
             filtered_features = []
+            neg100_prefix_lens = []  # 记录每个样本“前多少个是-100”
             for feature in features:
+                assert "labels" in feature, "样本缺少labels字段"
+                assert len(feature["labels"]) == len(feature["input_ids"]), f"labels与input_ids长度不一致！labels_len={len(feature['labels'])}, input_ids_len={len(feature['input_ids'])}"
+                # 关键步骤1：记录当前样本labels中“前导连续-100”的长度N
+                n = 0
+                for token_id in feature["labels"]:
+                    if token_id == -100:
+                        n += 1
+                    else:
+                        break  # 遇到非-100就停止（假设-100是前导连续的）
+                neg100_prefix_lens.append(n)  # 保存每个样本的N值
+                
                 filtered_feature = {
                     'input_ids': feature['input_ids'],
                     'attention_mask': feature['attention_mask'],
@@ -366,8 +429,23 @@ def main():
                     'dialog_histories': feature.get('dialog_histories', [])
                 }
                 filtered_features.append(filtered_feature)
-            return super().__call__(filtered_features)
-    
+            
+            # print("Collator前labels前10个token id：", filtered_features[0]['labels'][:10])
+            batch = super().__call__(filtered_features)
+            # 关键步骤2：还原每个样本labels的前N个为-100
+            batch_labels = batch['labels']  # 父类处理后的labels（可能已被覆盖）
+            for i in range(len(batch_labels)):
+                n = neg100_prefix_lens[i]  # 第i个样本的前导-100长度
+                target_length = batch_labels[i].shape[-1]  # 父类处理后的序列长度
+                actual_n = min(n, target_length)  # 避免N超过处理后的长度（截断场景）
+                if actual_n > 0:
+                    batch_labels[i, :actual_n] = -100  # 强制前actual_n个为-100
+            
+            batch['labels'] = batch_labels
+
+            # print("Collator后labels前10个token id：", batch['labels'][0, :10])
+            return batch
+
     data_collator = CustomDataCollator(tokenizer=tokenizer, mlm=False)
     
     # 计算总步数和预热步数

@@ -62,12 +62,10 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, 
         memory_answer = example.get("memory_answer", "")
         
         # 使用传入的max_history_rounds参数（默认为12）
-        # 2. 获取pad_token_id（避免硬编码）
         pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         # 3. 初始化固定形状的二维张量（填充pad_token_id）
         encoded_dialog_history = torch.full((max_history_rounds, max_length), pad_token_id, dtype=torch.long)
         
-        # 4. 编码有效对话轮次，填入张量
         for i, history_item in enumerate(dialog_history[:max_history_rounds]):  # 限制不超过最大轮数
             if not history_item:  # 跳过空字符串
                 continue
@@ -81,50 +79,87 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, 
             )
             # 填入二维张量的第i行（覆盖pad填充）
             encoded_dialog_history[i] = history_encoding["input_ids"][0]
-        
-        # 为大模型准备输入：只使用memory_query作为输入（减少计算量）
-        model_input = memory_query
-        
-        # 编码输入（只包含查询）
-        encoding = tokenizer(
-            model_input,
+
+        # 处理对话文本
+        messages = [
+            # {"role": "system", "content": "你是一个AI助手"},
+            {"role": "user", "content": memory_query},
+            {"role": "assistant", "content": memory_answer}
+        ]
+
+        input_ids = tokenizer.apply_chat_template(
+            messages,
             padding="max_length",
             truncation=True,
             max_length=max_length,
-            return_tensors="pt"
-        )
+            return_tensors="pt",
+            enable_thinking=False,
+            add_generation_prompt=False
+        ).squeeze(0)
+
+        attention_mask = (input_ids != tokenizer.pad_token_id).long()
         
-        # 编码答案，用于生成标签
-        answer_encoding = tokenizer(
-            memory_answer,
-            padding="max_length",
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
-        )
+        labels = input_ids.clone()
         
-        # 创建标签：查询部分不参与损失计算，答案部分作为目标
-        # 注意：这里假设答案长度不会超过max_length
-        labels = torch.full_like(encoding["input_ids"][0], -100)
-        # 获取答案的非填充部分长度
-        answer_tokens = answer_encoding["input_ids"][0]
-        # 找到第一个填充token的位置（假设使用0作为pad_token_id）
-        non_pad_mask = answer_tokens != tokenizer.pad_token_id
-        valid_answer_length = non_pad_mask.sum().item()
-        # 确保不超过max_length
-        answer_length = min(valid_answer_length, max_length)
-        # 仅在标签的开始部分填入答案的有效token
-        labels[:answer_length] = answer_encoding["input_ids"][0][:answer_length]
-        
-        # 返回处理后的数据
+        assistant_token_id = tokenizer.convert_tokens_to_ids(["assistant"])[0]
+
+        try:
+            assistant_start = (input_ids == assistant_token_id).nonzero()[0].item() + 1
+        except IndexError:
+            # 如果没找到，使用默认位置（通常不会发生）
+            assistant_start = 0
+
+        labels[:assistant_start+5] = -100
+
         return {
             "dialog_histories": encoded_dialog_history,
-            "memory_queries": memory_query,
-            "memory_answers": memory_answer,
-            "input_ids": encoding["input_ids"][0],
-            "attention_mask": encoding["attention_mask"][0],
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "labels": labels
         }
+
+        
+        # # 标准语言模型训练范式：完整序列输入，查询部分标签设为-100
+        # # 构建完整输入序列：memory_query + eos_token + memory_answer + eos_token
+        # full_input_text = f"{memory_query}{tokenizer.eos_token}{memory_answer}{tokenizer.eos_token}"
+        
+        # # 编码完整的输入文本
+        # encoding = tokenizer(
+        #     full_input_text,
+        #     padding="max_length",
+        #     truncation=True,
+        #     max_length=max_length,
+        #     return_tensors="pt"
+        # )
+        
+        # # 输入和注意力掩码
+        # input_ids = encoding["input_ids"][0]
+        # attention_mask = encoding["attention_mask"][0]
+        
+        # # 标签：复制输入序列，将查询部分（包含eos_token）设为-100，答案部分参与损失计算
+        # labels = input_ids.clone()
+        
+        # # 计算查询部分的长度（memory_query + eos_token）
+        # query_with_sep = f"{memory_query}{tokenizer.eos_token}"
+        # query_encoding = tokenizer(query_with_sep, add_special_tokens=False)
+        # query_length = len(query_encoding["input_ids"])
+        
+        # # 将查询部分设为-100（不参与损失计算）
+        # labels[:query_length] = -100
+        
+        # # 确保不超过序列长度
+        # if labels.shape[0] > max_length:
+        #     labels = labels[:max_length]
+        
+        # # 返回处理后的数据
+        # return {
+        #     "dialog_histories": encoded_dialog_history,
+        #     # "memory_queries": memory_query,
+        #     # "memory_answers": memory_answer,
+        #     "input_ids": input_ids,
+        #     "attention_mask": attention_mask,
+        #     "labels": labels
+        # }
     
     # 首先尝试从已保存的预处理数据加载（如果指定了保存路径且存在）
     if processed_data_path:

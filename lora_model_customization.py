@@ -71,9 +71,9 @@ class HippoLoRAQwen(nn.Module):
         self.gate_mechanisms = nn.ModuleDict()
         for layer_idx in self.fusion_layers:
             self.gate_mechanisms[f"layer_{layer_idx}"] = nn.Sequential(
-                nn.Linear(self.config.hidden_size * 2, 64),
+                nn.Linear(self.config.hidden_size * 2, 16),
                 nn.LeakyReLU(negative_slope=0.01),
-                nn.Linear(64, 1),
+                nn.Linear(16, 1),
                 nn.Sigmoid()
             )
         
@@ -144,6 +144,42 @@ class HippoLoRAQwen(nn.Module):
         for param in self.gate_mechanisms.parameters():
             param.requires_grad = True
 
+    def _print_labels_text(self, labels):
+        """
+        辅助函数：将 labels (token ids) 解码为文本并打印
+        """
+        # 确保 labels 在 CPU 上（避免设备不匹配问题）
+        labels_cpu = labels.cpu()
+        batch_size = labels_cpu.shape[0]
+        
+        print("\n" + "="*50)
+        print(f"Labels 对应的文本（共 {batch_size} 个样本）：")
+        print(labels[0][:8])
+        print("="*50)
+        
+        for idx in range(batch_size):
+            # 获取单个样本的 labels，过滤掉 -100（忽略索引）
+            sample_labels = labels_cpu[idx]
+            valid_labels = sample_labels[sample_labels != -100]  # 只保留有效 token id
+            
+            if len(valid_labels) == 0:
+                print(f"样本 {idx+1}：无有效 labels（全为 -100 或 padding）")
+                continue
+            
+            # 解码为文本（skip_special_tokens=True 跳过 pad_token、bos_token 等特殊 token）
+            text = self.tokenizer.decode(
+                valid_labels,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True  # 清理多余空格
+            )
+            
+            # 打印结果（包含样本索引、原始 token id 长度、有效 token id 长度、文本内容）
+            print(f"\n样本 {idx+1}：")
+            print(f"  - 原始 labels 长度：{len(sample_labels)}")
+            print(f"  - 有效 token id 长度：{len(valid_labels)}")
+            print(f"  - 文本内容：{text}")
+        
+        print("="*50 + "\n")
     def forward(self, input_ids=None, attention_mask=None, labels=None, dialog_histories=None):
         """
         前向传播方法
@@ -151,6 +187,7 @@ class HippoLoRAQwen(nn.Module):
         is_training = self.training
         batch_size, seq_len = input_ids.shape
 
+        # self._print_labels_text(labels)
         if self.hidden_h is None:
             self.hidden_h = self.hippo_model.reset_h(batch_size=batch_size)
 
